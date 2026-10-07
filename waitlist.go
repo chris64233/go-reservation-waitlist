@@ -10,16 +10,18 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("waitlist: promotion not found")
-	ErrConflict     = errors.New("waitlist: conflicting replay for promotion id")
-	ErrStaleVersion = errors.New("waitlist: waitlist version changed since promotion")
-	ErrClosed       = errors.New("waitlist: promotion already resolved in another terminal state")
-	ErrExpired      = errors.New("waitlist: confirmation deadline exceeded")
-	ErrNoCapacity   = errors.New("waitlist: no free slot")
-	ErrQueueEmpty   = errors.New("waitlist: no waiting application")
-	ErrDuplicateApp = errors.New("waitlist: application already exists")
-	ErrUnknownApp   = errors.New("waitlist: application not found")
-	ErrNotWaiting   = errors.New("waitlist: application is not waiting")
+	ErrNotFound        = errors.New("waitlist: promotion not found")
+	ErrConflict        = errors.New("waitlist: conflicting replay for promotion id")
+	ErrStaleVersion    = errors.New("waitlist: waitlist version changed since promotion")
+	ErrClosed          = errors.New("waitlist: promotion already resolved in another terminal state")
+	ErrExpired         = errors.New("waitlist: confirmation deadline exceeded")
+	ErrNoCapacity      = errors.New("waitlist: no free slot")
+	ErrQueueEmpty      = errors.New("waitlist: no waiting application")
+	ErrDuplicateApp    = errors.New("waitlist: application already exists")
+	ErrUnknownApp      = errors.New("waitlist: application not found")
+	ErrNotWaiting      = errors.New("waitlist: application is not waiting")
+	ErrInvalidRule     = errors.New("waitlist: invalid ranking rule")
+	ErrPreviewNotFound = errors.New("waitlist: reorder preview not found")
 )
 
 // PromotionState is the lifecycle state of a promotion offer.
@@ -65,11 +67,17 @@ const (
 	ReasonTimeout   = "timeout"
 )
 
-// Application is a waitlist entry.
+// Application is a waitlist entry. Qualification, RuleVersion and Basis are
+// the ranking snapshot captured at join time; Basis is derived from the
+// immutable rule version and guarantees a stable order within that version.
 type Application struct {
-	ID       string
-	Status   AppStatus
-	JoinedAt time.Time
+	ID            string
+	Status        AppStatus
+	JoinedAt      time.Time
+	Qualification Qualification
+	RuleVersion   int64
+	Basis         []string
+	seq           int64
 }
 
 // Promotion is an offer of a reserved slot to an applicant. It records the
@@ -80,6 +88,8 @@ type Promotion struct {
 	ApplicationID  string
 	SlotID         string
 	Version        int64
+	RuleVersion    int64
+	Basis          []string
 	NotificationID string
 	CreatedAt      time.Time
 	Deadline       time.Time
@@ -95,6 +105,10 @@ type PromoteRequest struct {
 	NotificationID string
 	SlotID         string // optional; empty auto-assigns the first free slot
 	Deadline       time.Time
+	// BaseVersion optionally pins the queue version the caller observed.
+	// When non-zero, promotion fails with ErrStaleVersion if the queue has
+	// since been reordered or otherwise changed.
+	BaseVersion int64
 }
 
 // SlotEvent is one entry in the slot ledger.
@@ -117,11 +131,14 @@ type SlotView struct {
 
 // View is a consistent snapshot of the waitlist for queries.
 type View struct {
-	Version    int64
-	Queue      []Application
-	Promotions []Promotion
-	Slots      []SlotView
-	Events     []SlotEvent
+	Version            int64
+	Rule               Rule
+	Queue              []Application
+	Promotions         []Promotion
+	Slots              []SlotView
+	Events             []SlotEvent
+	LastReorder        *ReorderResult
+	OutstandingPreview *ReorderPreview
 }
 
 // ScanResult reports what a Scan did.
@@ -138,16 +155,20 @@ type slot struct {
 
 // Waitlist is a concurrency-safe reservation waitlist. Construct with New.
 type Waitlist struct {
-	mu         sync.Mutex
-	ttl        time.Duration
-	version    int64
-	seq        int64
-	queue      []string
-	apps       map[string]*Application
-	promotions map[string]*Promotion
-	order      []string
-	slots      []*slot
-	events     []SlotEvent
+	mu          sync.Mutex
+	ttl         time.Duration
+	version     int64
+	seq         int64
+	queue       []string
+	apps        map[string]*Application
+	promotions  map[string]*Promotion
+	order       []string
+	slots       []*slot
+	events      []SlotEvent
+	rule        Rule
+	joinSeq     int64
+	previews    map[string]*storedPreview
+	lastReorder *ReorderResult
 }
 
 // New creates a waitlist with the given slot capacity and the confirmation
@@ -157,6 +178,8 @@ func New(capacity int, ttl time.Duration) *Waitlist {
 		ttl:        ttl,
 		apps:       make(map[string]*Application),
 		promotions: make(map[string]*Promotion),
+		rule:       defaultRule(),
+		previews:   make(map[string]*storedPreview),
 	}
 	for i := 0; i < capacity; i++ {
 		w.slots = append(w.slots, &slot{id: fmt.Sprintf("slot-%d", i+1), state: SlotFree})
@@ -166,16 +189,7 @@ func New(capacity int, ttl time.Duration) *Waitlist {
 
 // Join adds an application to the tail of the queue.
 func (w *Waitlist) Join(appID string, now time.Time) (Application, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if _, ok := w.apps[appID]; ok {
-		return Application{}, ErrDuplicateApp
-	}
-	app := &Application{ID: appID, Status: StatusWaiting, JoinedAt: now}
-	w.apps[appID] = app
-	w.queue = append(w.queue, appID)
-	w.version++
-	return *app, nil
+	return w.JoinWith(appID, Qualification{}, now)
 }
 
 // Leave withdraws a waiting application.
@@ -191,6 +205,7 @@ func (w *Waitlist) Leave(appID string) error {
 	}
 	w.removeFromQueue(appID)
 	app.Status = StatusWithdrawn
+	w.invalidatePreviewsLocked()
 	w.version++
 	return nil
 }
@@ -205,10 +220,14 @@ func (w *Waitlist) Promote(req PromoteRequest, now time.Time) (Promotion, error)
 	if existing, ok := w.promotions[req.ID]; ok {
 		if existing.NotificationID == req.NotificationID &&
 			(req.SlotID == "" || existing.SlotID == req.SlotID) &&
-			existing.Deadline.Equal(req.Deadline) {
+			existing.Deadline.Equal(req.Deadline) &&
+			(req.BaseVersion == 0 || existing.Version == req.BaseVersion) {
 			return *existing, nil
 		}
 		return Promotion{}, ErrConflict
+	}
+	if req.BaseVersion != 0 && req.BaseVersion != w.version {
+		return Promotion{}, ErrStaleVersion
 	}
 	return w.promoteLocked(req, now)
 }
@@ -265,14 +284,18 @@ func (w *Waitlist) Decline(promotionID string, now time.Time) (Promotion, error)
 	p.ResolvedAt = now
 	w.apps[p.ApplicationID].Status = StatusDeclined
 	w.releaseSlotLocked(p, ReasonDeclined, now)
+	w.invalidatePreviewsLocked()
 	w.version++
 	return *p, nil
 }
 
 // Scan expires pending promotions whose deadline has passed, releases their
-// slots, then offers freed slots to the current queue head in order.
-// Applications that declined or expired stay out of the queue and are never
-// re-promoted by the same or later scans.
+// slots, then offers freed slots to the current queue head in order. Every
+// decision is made under a single queue version captured at scan start:
+// promotions created by this scan record that version, so a concurrently
+// published rule reorder cannot keep an older scan handing out slots in a
+// stale order. Applications that declined or expired stay out of the queue
+// and are never re-promoted by the same or later scans.
 func (w *Waitlist) Scan(now time.Time) ScanResult {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -305,17 +328,28 @@ func (w *Waitlist) Scan(now time.Time) ScanResult {
 func (w *Waitlist) View() View {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	v := View{Version: w.version}
+	v := View{Version: w.version, Rule: w.rule}
 	for _, id := range w.queue {
 		v.Queue = append(v.Queue, *w.apps[id])
 	}
 	for _, id := range w.order {
-		v.Promotions = append(v.Promotions, *w.promotions[id])
+		p := w.promotions[id]
+		cp := *p
+		cp.Basis = append([]string(nil), p.Basis...)
+		v.Promotions = append(v.Promotions, cp)
 	}
 	for _, s := range w.slots {
 		v.Slots = append(v.Slots, SlotView{ID: s.id, State: s.state, PromotionID: s.promotion})
 	}
 	v.Events = append(v.Events, w.events...)
+	v.LastReorder = w.lastReorder
+	for _, p := range w.previews {
+		if !p.committed {
+			snap := p.snapshot()
+			v.OutstandingPreview = &snap
+			break
+		}
+	}
 	return v
 }
 
@@ -330,11 +364,14 @@ func (w *Waitlist) promoteLocked(req PromoteRequest, now time.Time) (Promotion, 
 	appID := w.queue[0]
 	w.queue = w.queue[1:]
 	w.version++
+	head := w.apps[appID]
 	p := &Promotion{
 		ID:             req.ID,
 		ApplicationID:  appID,
 		SlotID:         s.id,
 		Version:        w.version,
+		RuleVersion:    head.RuleVersion,
+		Basis:          append([]string(nil), head.Basis...),
 		NotificationID: req.NotificationID,
 		CreatedAt:      now,
 		Deadline:       req.Deadline,
@@ -345,15 +382,24 @@ func (w *Waitlist) promoteLocked(req PromoteRequest, now time.Time) (Promotion, 
 	w.apps[appID].Status = StatusPromoted
 	s.state = SlotReserved
 	s.promotion = p.ID
+	w.invalidatePreviewsLocked()
 	w.appendEvent(s.id, p, ActionReserved, ReasonPromoted, now)
 	return *p, nil
 }
+
+// invalidatePreviewsLocked is a marker invoked before any mutation that
+// moves the queue version (join, leave, promotion, decline, expiry,
+// qualification change). Preview records are intentionally kept: replaying
+// the same reorder id must report ErrStaleVersion rather than silently
+// minting a fresh preview, and committed previews remain replayable.
+func (w *Waitlist) invalidatePreviewsLocked() {}
 
 func (w *Waitlist) expireLocked(p *Promotion, now time.Time) {
 	p.State = PromotionExpired
 	p.ResolvedAt = now
 	w.apps[p.ApplicationID].Status = StatusExpired
 	w.releaseSlotLocked(p, ReasonTimeout, now)
+	w.invalidatePreviewsLocked()
 	w.version++
 }
 
