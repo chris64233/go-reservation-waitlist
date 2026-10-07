@@ -20,6 +20,8 @@ var (
 	ErrDuplicateApp = errors.New("waitlist: application already exists")
 	ErrUnknownApp   = errors.New("waitlist: application not found")
 	ErrNotWaiting   = errors.New("waitlist: application is not waiting")
+	ErrPreviewGone  = errors.New("waitlist: reorder preview is stale or was not prepared")
+	ErrRuleMissing  = errors.New("waitlist: rule version not found")
 )
 
 // PromotionState is the lifecycle state of a promotion offer.
@@ -67,9 +69,12 @@ const (
 
 // Application is a waitlist entry.
 type Application struct {
-	ID       string
-	Status   AppStatus
-	JoinedAt time.Time
+	ID          string
+	Status      AppStatus
+	JoinedAt    time.Time
+	RuleVersion int64
+	Seq         int64
+	Profile     AppProfile
 }
 
 // Promotion is an offer of a reserved slot to an applicant. It records the
@@ -80,11 +85,14 @@ type Promotion struct {
 	ApplicationID  string
 	SlotID         string
 	Version        int64
+	QueueVersion   int64
+	RuleVersion    int64
 	NotificationID string
 	CreatedAt      time.Time
 	Deadline       time.Time
 	State          PromotionState
 	ResolvedAt     time.Time
+	Basis          PromotionBasis
 }
 
 // PromoteRequest creates a promotion for the head of the queue. ID is the
@@ -117,11 +125,21 @@ type SlotView struct {
 
 // View is a consistent snapshot of the waitlist for queries.
 type View struct {
-	Version    int64
-	Queue      []Application
-	Promotions []Promotion
-	Slots      []SlotView
-	Events     []SlotEvent
+	Version      int64
+	QueueVersion int64
+	RuleVersion  int64
+	Queue        []Application
+	Promotions   []Promotion
+	Slots        []SlotView
+	Events       []SlotEvent
+	Changes      []PositionChange
+}
+
+// QueueEntry is one application in the current queue together with its
+// current position and the immutable snapshot it joined with.
+type QueueEntry struct {
+	Application Application
+	Position    int
 }
 
 // ScanResult reports what a Scan did.
@@ -136,18 +154,34 @@ type slot struct {
 	promotion string
 }
 
+// AppProfile is the immutable eligibility snapshot captured when an
+// application joins the queue. It is the basis every rule version compares.
+type AppProfile struct {
+	Eligible bool
+	Priority int
+	Score    int
+	Member   bool
+}
+
 // Waitlist is a concurrency-safe reservation waitlist. Construct with New.
 type Waitlist struct {
-	mu         sync.Mutex
-	ttl        time.Duration
-	version    int64
-	seq        int64
-	queue      []string
-	apps       map[string]*Application
-	promotions map[string]*Promotion
-	order      []string
-	slots      []*slot
-	events     []SlotEvent
+	mu           sync.Mutex
+	ttl          time.Duration
+	version      int64
+	queueVersion int64
+	seq          int64
+	joinSeq      int64
+	queue        []string
+	apps         map[string]*Application
+	promotions   map[string]*Promotion
+	order        []string
+	slots        []*slot
+	events       []SlotEvent
+	rules        map[int64]*RuleSet
+	ruleVersions []int64
+	activeRule   int64
+	previews     map[string]*storedPreview
+	lastChanges  []PositionChange
 }
 
 // New creates a waitlist with the given slot capacity and the confirmation
@@ -157,7 +191,10 @@ func New(capacity int, ttl time.Duration) *Waitlist {
 		ttl:        ttl,
 		apps:       make(map[string]*Application),
 		promotions: make(map[string]*Promotion),
+		rules:      make(map[int64]*RuleSet),
+		previews:   make(map[string]*storedPreview),
 	}
+	w.installRuleLocked(DefaultRules())
 	for i := 0; i < capacity; i++ {
 		w.slots = append(w.slots, &slot{id: fmt.Sprintf("slot-%d", i+1), state: SlotFree})
 	}
@@ -166,15 +203,33 @@ func New(capacity int, ttl time.Duration) *Waitlist {
 
 // Join adds an application to the tail of the queue.
 func (w *Waitlist) Join(appID string, now time.Time) (Application, error) {
+	return w.JoinWithProfile(appID, AppProfile{}, now)
+}
+
+// JoinWithProfile adds an application using the given eligibility snapshot.
+// The snapshot, the enqueue sequence and the active rule version are frozen
+// on the application and never change; under one rule version this makes
+// the queue order fully stable.
+func (w *Waitlist) JoinWithProfile(appID string, profile AppProfile, now time.Time) (Application, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if _, ok := w.apps[appID]; ok {
 		return Application{}, ErrDuplicateApp
 	}
-	app := &Application{ID: appID, Status: StatusWaiting, JoinedAt: now}
+	w.joinSeq++
+	app := &Application{
+		ID:          appID,
+		Status:      StatusWaiting,
+		JoinedAt:    now,
+		RuleVersion: w.activeRule,
+		Seq:         w.joinSeq,
+		Profile:     profile,
+	}
 	w.apps[appID] = app
-	w.queue = append(w.queue, appID)
+	w.insertOrderedLocked(app)
 	w.version++
+	w.queueVersion++
+	w.invalidatePreviewsLocked()
 	return *app, nil
 }
 
@@ -192,6 +247,8 @@ func (w *Waitlist) Leave(appID string) error {
 	w.removeFromQueue(appID)
 	app.Status = StatusWithdrawn
 	w.version++
+	w.queueVersion++
+	w.invalidatePreviewsLocked()
 	return nil
 }
 
@@ -266,6 +323,8 @@ func (w *Waitlist) Decline(promotionID string, now time.Time) (Promotion, error)
 	w.apps[p.ApplicationID].Status = StatusDeclined
 	w.releaseSlotLocked(p, ReasonDeclined, now)
 	w.version++
+	w.queueVersion++
+	w.invalidatePreviewsLocked()
 	return *p, nil
 }
 
@@ -305,7 +364,11 @@ func (w *Waitlist) Scan(now time.Time) ScanResult {
 func (w *Waitlist) View() View {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	v := View{Version: w.version}
+	v := View{
+		Version:      w.version,
+		QueueVersion: w.queueVersion,
+		RuleVersion:  w.activeRule,
+	}
 	for _, id := range w.queue {
 		v.Queue = append(v.Queue, *w.apps[id])
 	}
@@ -316,7 +379,38 @@ func (w *Waitlist) View() View {
 		v.Slots = append(v.Slots, SlotView{ID: s.id, State: s.state, PromotionID: s.promotion})
 	}
 	v.Events = append(v.Events, w.events...)
+	v.Changes = append(v.Changes, w.lastChanges...)
 	return v
+}
+
+// QueueView returns the current queue order with 1-based positions and the
+// frozen eligibility snapshot of every waiting application.
+func (w *Waitlist) QueueView() []QueueEntry {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	entries := make([]QueueEntry, 0, len(w.queue))
+	for pos, id := range w.queue {
+		entries = append(entries, QueueEntry{Application: *w.apps[id], Position: pos + 1})
+	}
+	return entries
+}
+
+// ActiveRule returns the immutable rule set currently applied to the queue.
+func (w *Waitlist) ActiveRule() RuleSet {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return *w.rules[w.activeRule]
+}
+
+// Rule returns an installed rule set by version.
+func (w *Waitlist) Rule(version int64) (RuleSet, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	r, ok := w.rules[version]
+	if !ok {
+		return RuleSet{}, ErrRuleMissing
+	}
+	return *r, nil
 }
 
 func (w *Waitlist) promoteLocked(req PromoteRequest, now time.Time) (Promotion, error) {
@@ -328,17 +422,23 @@ func (w *Waitlist) promoteLocked(req PromoteRequest, now time.Time) (Promotion, 
 		return Promotion{}, err
 	}
 	appID := w.queue[0]
+	app := w.apps[appID]
 	w.queue = w.queue[1:]
 	w.version++
+	w.queueVersion++
+	w.invalidatePreviewsLocked()
 	p := &Promotion{
 		ID:             req.ID,
 		ApplicationID:  appID,
 		SlotID:         s.id,
 		Version:        w.version,
+		QueueVersion:   w.queueVersion,
+		RuleVersion:    w.activeRule,
 		NotificationID: req.NotificationID,
 		CreatedAt:      now,
 		Deadline:       req.Deadline,
 		State:          PromotionPending,
+		Basis:          w.promotionBasisLocked(app),
 	}
 	w.promotions[p.ID] = p
 	w.order = append(w.order, p.ID)
@@ -355,6 +455,8 @@ func (w *Waitlist) expireLocked(p *Promotion, now time.Time) {
 	w.apps[p.ApplicationID].Status = StatusExpired
 	w.releaseSlotLocked(p, ReasonTimeout, now)
 	w.version++
+	w.queueVersion++
+	w.invalidatePreviewsLocked()
 }
 
 func (w *Waitlist) releaseSlotLocked(p *Promotion, reason string, now time.Time) {

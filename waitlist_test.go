@@ -1,6 +1,7 @@
 package goreservationwaitlist
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -161,7 +162,7 @@ func TestPromoteIdempotentReplayAndConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if replay != p {
+	if !reflect.DeepEqual(replay, p) {
 		t.Fatalf("replay = %+v, want %+v", replay, p)
 	}
 
